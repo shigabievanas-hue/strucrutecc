@@ -1,0 +1,168 @@
+package com.example.structurecopier;
+
+import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.brigadier.context.CommandContext;
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.util.InputUtil;
+import org.lwjgl.glfw.GLFW;
+import net.minecraft.block.AbstractChestBlock;
+import net.minecraft.block.BarrelBlock;
+import net.minecraft.block.BlockState;
+import net.minecraft.block.enums.ChestType;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.state.property.Properties;
+import net.minecraft.item.Item;
+import net.minecraft.text.Text;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
+import net.minecraft.util.math.BlockPos;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.stream.Stream;
+
+import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.argument;
+import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.literal;
+
+public class StructureCopierClient implements ClientModInitializer {
+    public static final Builder builder = new Builder();
+    public static BlockPos pos1, pos2;
+    private static Path dir;
+
+    @Override
+    public void onInitializeClient() {
+        dir = FabricLoader.getInstance().getGameDir().resolve("structurecopier");
+        ClientCommandRegistrationCallback.EVENT.register((d, access) -> register(d));
+        Library.loadSettings();
+        ClientTickEvents.END_CLIENT_TICK.register(builder::tick);
+
+        KeyBinding menuKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.structurecopier.menu", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_RIGHT_CONTROL, KeyBinding.Category.MISC));
+        KeyBinding autoKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.structurecopier.auto", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_K, KeyBinding.Category.MISC));
+        ClientTickEvents.END_CLIENT_TICK.register(mc -> {
+            while (menuKey.wasPressed()) mc.setScreen(new MenuScreen());
+            while (autoKey.wasPressed()) builder.toggleAuto(mc.player);
+        });
+    }
+
+    public static BlockPos looked() {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.crosshairTarget instanceof BlockHitResult h && h.getType() == HitResult.Type.BLOCK) return h.getBlockPos();
+        return mc.player.getBlockPos();
+    }
+
+    /** Mark the chest/barrel you look at as the supply chest. Returns a message. */
+    public static String setChest() {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.world == null) return "Нет мира";
+        if (!(mc.crosshairTarget instanceof BlockHitResult h) || h.getType() != HitResult.Type.BLOCK)
+            return "Посмотри на сундук или бочку";
+        BlockState s = mc.world.getBlockState(h.getBlockPos());
+        if (!(s.getBlock() instanceof AbstractChestBlock) && !(s.getBlock() instanceof BarrelBlock))
+            return "Это не сундук и не бочка";
+        builder.chestPos = h.getBlockPos();
+        boolean dbl = s.contains(Properties.CHEST_TYPE) && s.get(Properties.CHEST_TYPE) != ChestType.SINGLE;
+        return "Склад: " + builder.chestPos.toShortString() + (dbl ? " (двойной сундук)" : "");
+    }
+
+    public static BlockPos lookedAbove() {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.crosshairTarget instanceof BlockHitResult h && h.getType() == HitResult.Type.BLOCK) return h.getBlockPos().up();
+        return mc.player.getBlockPos();
+    }
+
+    private static void fb(CommandContext<FabricClientCommandSource> c, String s) {
+        c.getSource().sendFeedback(Text.literal("[SC] " + s));
+    }
+
+    private static Path file(String name) {
+        return dir.resolve(name.replaceAll("[^A-Za-z0-9_-]", "_") + ".sc.txt");
+    }
+
+    private void register(CommandDispatcher<FabricClientCommandSource> d) {
+        d.register(literal("sc")
+            .then(literal("menu").executes(c -> {
+                MinecraftClient mc = MinecraftClient.getInstance();
+                mc.send(() -> mc.setScreen(new MenuScreen()));
+                return 1;
+            }))
+            .then(literal("auto").executes(c -> { builder.toggleAuto(MinecraftClient.getInstance().player); return 1; }))
+            .then(literal("chest")
+                .executes(c -> { fb(c, setChest()); return 1; })
+                .then(literal("clear").executes(c -> { builder.chestPos = null; fb(c, "Сундук-склад сброшен"); return 1; })))
+            .then(literal("res").executes(c -> {
+                MinecraftClient mc = MinecraftClient.getInstance();
+                mc.send(() -> mc.setScreen(MenuScreen.open(3)));
+                return 1;
+            }))
+            .then(literal("walk").executes(c -> {
+                builder.autoWalk = !builder.autoWalk;
+                fb(c, "Авто-ходьба: " + (builder.autoWalk ? "ВКЛ" : "ВЫКЛ"));
+                return 1;
+            }))
+            .then(literal("pos1").executes(c -> { pos1 = looked(); fb(c, "pos1 = " + pos1.toShortString()); return 1; }))
+            .then(literal("pos2").executes(c -> { pos2 = looked(); fb(c, "pos2 = " + pos2.toShortString()); return 1; }))
+            .then(literal("copy").then(argument("name", StringArgumentType.greedyString()).executes(c -> {
+                Library.Result r = Library.saveSelection(StringArgumentType.getString(c, "name"));
+                fb(c, r.msg());
+                return r.ok() ? 1 : 0;
+            })))
+            .then(literal("list").executes(c -> { fb(c, "Постройки: " + Library.list()); return 1; }))
+            .then(literal("load").then(argument("name", StringArgumentType.greedyString()).executes(c -> {
+                Library.Result r = Library.load(StringArgumentType.getString(c, "name"));
+                fb(c, r.msg());
+                return r.ok() ? 1 : 0;
+            })))
+            .then(literal("delete").then(argument("name", StringArgumentType.greedyString()).executes(c -> {
+                Library.Result r = Library.delete(StringArgumentType.getString(c, "name"));
+                fb(c, r.msg());
+                return r.ok() ? 1 : 0;
+            })))
+            .then(literal("lib").executes(c -> {
+                MinecraftClient mc = MinecraftClient.getInstance();
+                mc.send(() -> mc.setScreen(MenuScreen.open(2)));
+                return 1;
+            }))
+            .then(literal("origin").executes(c -> { builder.origin = lookedAbove(); builder.reset(); fb(c, "Угол: " + builder.origin.toShortString()); return 1; }))
+            .then(literal("shift").then(argument("dx", IntegerArgumentType.integer()).then(argument("dy", IntegerArgumentType.integer())
+                .then(argument("dz", IntegerArgumentType.integer()).executes(c -> {
+                    if (builder.origin == null) { fb(c, "Сначала /sc load"); return 0; }
+                    builder.origin = builder.origin.add(IntegerArgumentType.getInteger(c, "dx"), IntegerArgumentType.getInteger(c, "dy"), IntegerArgumentType.getInteger(c, "dz"));
+                    builder.reset();
+                    fb(c, "Угол: " + builder.origin.toShortString());
+                    return 1;
+                })))))
+            .then(literal("rotate").executes(c -> {
+                if (builder.schem == null) { fb(c, "Сначала /sc load"); return 0; }
+                builder.schem.rotate(); builder.reset(); fb(c, "Повёрнуто на 90°"); return 1;
+            }))
+            .then(literal("start").executes(c -> {
+                if (builder.schem == null) { fb(c, "Сначала /sc load"); return 0; }
+                builder.reset(); builder.running = true; fb(c, "Стройка запущена. Ходи рядом с зоной (радиус ~4 блока)."); return 1;
+            }))
+            .then(literal("stop").executes(c -> { builder.running = false; fb(c, "Остановлено"); return 1; }))
+            .then(literal("delay").then(argument("ticks", IntegerArgumentType.integer(1, 20)).executes(c -> {
+                builder.delay = IntegerArgumentType.getInteger(c, "ticks"); fb(c, "Задержка: " + builder.delay + " тиков"); return 1;
+            })))
+            .then(literal("status").executes(c -> {
+                if (builder.schem == null) { fb(c, "Ничего не загружено"); return 0; }
+                StringBuilder sb = new StringBuilder("Осталось: " + builder.remaining(c.getSource().getWorld()) + (builder.running ? " (идёт)" : " (стоп)"));
+                if (!builder.missing().isEmpty()) {
+                    sb.append("\nНет в инвентаре: ");
+                    for (Item i : builder.missing()) sb.append(i.getName().getString()).append(", ");
+                }
+                fb(c, sb.toString());
+                return 1;
+            }))
+        );
+    }
+}

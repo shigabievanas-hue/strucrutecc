@@ -1,0 +1,635 @@
+package com.example.structurecopier;
+
+import net.minecraft.block.*;
+import net.minecraft.block.enums.BedPart;
+import net.minecraft.block.enums.BlockHalf;
+import net.minecraft.block.enums.DoubleBlockHalf;
+import net.minecraft.block.enums.SlabType;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.screen.ingame.GenericContainerScreen;
+import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.client.world.ClientWorld;
+import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.item.BlockItem;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
+import net.minecraft.particle.ParticleTypes;
+import net.minecraft.screen.slot.SlotActionType;
+import net.minecraft.state.property.Properties;
+import net.minecraft.text.Text;
+import net.minecraft.util.Hand;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.Vec3d;
+
+import java.util.*;
+
+public class Builder {
+    private static final double REACH = 4.5;
+
+    public Schematic schem;
+    public BlockPos origin;
+    public boolean running;
+    public int delay = 2;          // ticks between placements
+    public boolean airplace;       // auto-build places blocks without needing a neighbour block
+    public boolean manualAirplace; // hold RMB while looking at nothing -> place block in the air
+    public int airDist = 4;        // distance (2..5) for manual airplace
+    private int manualCd;
+
+    // --- auto-walk state ---
+    public boolean autoWalk;
+    private List<BlockPos> path;
+    private int pi, planCd, planFail, goalStuck, stuckTicks, stuckTotal;
+    private double lastHd = 9;
+    private boolean holding;
+    private final Set<Long> blocked = new HashSet<>();   // cells that still must receive a block: never stand there
+    private static final Direction[] HORIZ = {Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST};
+    private int cooldown, tickCount;
+    private final Map<BlockPos, Integer> attempts = new HashMap<>();
+    private final Set<Item> missing = new LinkedHashSet<>();
+
+    /** One-button start/stop: airplace + auto-walk. */
+    public void toggleAuto(ClientPlayerEntity p) {
+        if (p == null) return;
+        if (schem == null || origin == null) { msg(p, "Сначала /sc load имя"); return; }
+        if (running) { running = false; msg(p, "Стройка остановлена"); return; }
+        airplace = true; autoWalk = true;
+        reset();
+        running = true;
+        msg(p, "Стройка запущена (airplace + ходьба)");
+    }
+
+    public void reset() {
+        attempts.clear(); missing.clear();
+        path = null; pi = 0; planCd = 0; planFail = 0; goalStuck = 0; stuckTicks = 0; stuckTotal = 0;
+        supplyState = 0;
+    }
+
+    public Set<Item> missing() { return missing; }
+
+    public void tick(MinecraftClient mc) {
+        ClientPlayerEntity p = mc.player;
+        ClientWorld w = mc.world;
+        if (p == null || w == null || mc.interactionManager == null) return;
+        manual(mc, p, w);
+        if (schem == null || origin == null) return;
+        tickCount++;
+        if (tickCount % 10 == 0) drawOutline(w, p);
+        if (!running) { stopWalking(mc); supplyState = 0; return; }
+        if (supplyState != 0) { supplyTick(mc, p, w); return; }
+        if (mc.currentScreen != null) { stopWalking(mc); return; }
+
+        if (tickCount % 100 == 0 && remaining(w) == 0) {
+            running = false; stopWalking(mc);
+            msg(p, "Готово: все блоки поставлены.");
+            return;
+        }
+        if (--cooldown <= 0) {
+            cooldown = delay;
+            if (placeOne(mc, p, w)) {
+                stopWalking(mc);
+                goalStuck = 0; stuckTotal = 0; planFail = 0;
+                return;
+            }
+        }
+        if (autoWalk) walk(mc, p, w); else stopWalking(mc);
+    }
+
+    /** Try to place one block that is currently in reach. */
+    private boolean placeOne(MinecraftClient mc, ClientPlayerEntity p, ClientWorld w) {
+        missing.clear();
+        Vec3d eye = p.getEyePos();
+        for (Schematic.Entry e : schem.blocks) {
+            BlockPos pos = origin.add(e.x, e.y, e.z);
+            if (eye.squaredDistanceTo(Vec3d.ofCenter(pos)) > REACH * REACH) continue;
+            BlockState target = e.state;
+            Block tb = target.getBlock();
+            if (skip(target)) continue;
+            BlockState cur = w.getBlockState(pos);
+            if (cur.isOf(tb) || !cur.isReplaceable()) continue;
+            if (attempts.getOrDefault(pos, 0) >= 3) continue;
+            Item item = tb.asItem();
+            if (item == Items.AIR) continue;
+            if (!target.getCollisionShape(w, pos).isEmpty() && p.getBoundingBox().intersects(new Box(pos))) continue;
+            BlockHitResult hit = findHit(w, pos, target, eye);
+            if (hit == null) continue;
+            if (!prepareItem(mc, p, item)) { missing.add(item); continue; }
+
+            float[] rot = desiredRotation(target, p);
+            p.networkHandler.sendPacket(new PlayerMoveC2SPacket.LookAndOnGround(
+                    rot[0], rot[1], p.isOnGround(), p.horizontalCollision));
+            mc.interactionManager.interactBlock(p, Hand.MAIN_HAND, hit);
+            attempts.merge(pos, 1, Integer::sum);
+            return true;
+        }
+        return false;
+    }
+
+
+    // ====================== SUPPLY CHEST ======================
+
+    public BlockPos chestPos;
+    private Map<Item, Integer> chestSeen;      // snapshot of the chest contents from the last visit
+    private boolean chestScanned;
+
+    public record Res(Item item, int need, int have, int chest) {}
+
+    /** Items still required for unfinished blocks, with inventory and last-seen chest counts (-1 = chest not inspected yet). */
+    public List<Res> resources(ClientWorld w, ClientPlayerEntity p) {
+        List<Res> out = new ArrayList<>();
+        if (schem == null || origin == null || w == null || p == null) return out;
+        Map<Item, Integer> need = new HashMap<>();
+        for (Schematic.Entry e : schem.blocks) {
+            if (skip(e.state)) continue;
+            Item it = e.state.getBlock().asItem();
+            if (it == Items.AIR) continue;
+            BlockState cur = w.getBlockState(origin.add(e.x, e.y, e.z));
+            if (cur.isOf(e.state.getBlock()) || !cur.isReplaceable()) continue;
+            need.merge(it, 1, Integer::sum);
+        }
+        Map<Item, Integer> inv = new HashMap<>();
+        PlayerInventory pi = p.getInventory();
+        for (int i = 0; i < 36; i++) {
+            ItemStack s = pi.getStack(i);
+            if (!s.isEmpty()) inv.merge(s.getItem(), s.getCount(), Integer::sum);
+        }
+        for (Map.Entry<Item, Integer> en : need.entrySet()) {
+            Item it = en.getKey();
+            int chest = chestSeen == null ? -1 : Math.max(0, chestSeen.getOrDefault(it, 0));
+            out.add(new Res(it, en.getValue(), inv.getOrDefault(it, 0), chest));
+        }
+        out.sort(Comparator.comparingInt((Res r) -> r.need()).reversed());
+        return out;
+    }
+
+    private int supplyState, supplyTimer, takeClicks;   // 0 none, 1 walk to chest, 2 open, 3 take
+    private boolean tookAny;
+    private final Map<Item, Integer> planNeed = new HashMap<>(), invCount = new HashMap<>(), supplyDeficit = new HashMap<>();
+    private final Set<Item> supplyWanted = new LinkedHashSet<>();
+
+    private void startSupply(ClientPlayerEntity p) {
+        supplyDeficit.clear();
+        supplyWanted.clear();
+        for (Map.Entry<Item, Integer> en : planNeed.entrySet()) {
+            int d = en.getValue() - invCount.getOrDefault(en.getKey(), 0);
+            if (d > 0) supplyDeficit.put(en.getKey(), d);
+        }
+        supplyWanted.addAll(missing);
+        chestScanned = false;
+        tookAny = false; takeClicks = 0; supplyState = 1; supplyTimer = 0; planCd = 0;
+        msg(p, "Блоки кончились, иду к сундуку");
+    }
+
+    private void failSupply(MinecraftClient mc, ClientPlayerEntity p, String text) {
+        supplyState = 0; running = false;
+        stopWalking(mc);
+        msg(p, text);
+    }
+
+    private boolean hasRoom(ClientPlayerEntity p, ItemStack s) {
+        PlayerInventory inv = p.getInventory();
+        for (int i = 0; i < 36; i++) {
+            ItemStack t = inv.getStack(i);
+            if (t.isEmpty()) return true;
+            if (t.isOf(s.getItem()) && t.getCount() < t.getMaxCount()) return true;
+        }
+        return false;
+    }
+
+    private void supplyTick(MinecraftClient mc, ClientPlayerEntity p, ClientWorld w) {
+        if (chestPos == null) { supplyState = 0; return; }
+        Vec3d chestCenter = Vec3d.ofCenter(chestPos);
+        switch (supplyState) {
+            case 1 -> {
+                if (mc.currentScreen != null) return;
+                if (p.getEyePos().squaredDistanceTo(chestCenter) <= 4.0 * 4.0) {
+                    stopWalking(mc);
+                    supplyState = 2; supplyTimer = 0;
+                    return;
+                }
+                if (path == null) {
+                    if (!p.isOnGround()) return;
+                    if (planCd-- > 0) { stopKeys(mc); return; }
+                    List<BlockPos> found = bfs(w, p.getBlockPos(), List.of(chestPos));
+                    if (found == null) { failSupply(mc, p, "Не нахожу безопасный путь к сундуку."); return; }
+                    if (found.isEmpty()) found = new ArrayList<>(List.of(p.getBlockPos()));
+                    path = found; pi = 0; stuckTicks = 0; lastHd = 9;
+                }
+                followPath(mc, p, w);
+                if (path == null && stuckTotal > 8) failSupply(mc, p, "Застрял по дороге к сундуку.");
+            }
+            case 2 -> {
+                if (mc.currentScreen instanceof GenericContainerScreen) { supplyState = 3; supplyTimer = 0; return; }
+                supplyTimer++;
+                if (supplyTimer > 80) { failSupply(mc, p, "Не могу открыть сундук (сверху блок или он занят)."); return; }
+                if (supplyTimer % 10 == 1) {
+                    Vec3d eye = p.getEyePos();
+                    Direction face = Direction.getFacing(eye.x - chestCenter.x, eye.y - chestCenter.y, eye.z - chestCenter.z);
+                    Vec3d hit = chestCenter.add(face.getOffsetX() * 0.5, face.getOffsetY() * 0.5, face.getOffsetZ() * 0.5);
+                    mc.interactionManager.interactBlock(p, Hand.MAIN_HAND, new BlockHitResult(hit, face, chestPos, false));
+                }
+            }
+            case 3 -> {
+                if (!(mc.currentScreen instanceof GenericContainerScreen gcs)) {
+                    if (++supplyTimer > 20) { supplyState = 2; supplyTimer = 0; }
+                    return;
+                }
+                if (!chestScanned) {
+                    chestSeen = new HashMap<>();
+                    var h0 = gcs.getScreenHandler();
+                    for (int i = 0; i < h0.getRows() * 9; i++) {
+                        ItemStack s0 = h0.getSlot(i).getStack();
+                        if (!s0.isEmpty()) chestSeen.merge(s0.getItem(), s0.getCount(), Integer::sum);
+                    }
+                    chestScanned = true;
+                }
+                if (++supplyTimer % 3 != 0) return;
+                var handler = gcs.getScreenHandler();
+                int chestSlots = handler.getRows() * 9;
+                if (takeClicks < 150) {
+                    for (int i = 0; i < chestSlots; i++) {
+                        ItemStack s = handler.getSlot(i).getStack();
+                        if (s.isEmpty()) continue;
+                        Integer d = supplyDeficit.get(s.getItem());
+                        if (d == null || d <= 0 || !hasRoom(p, s)) continue;
+                        int cnt = s.getCount();
+                        mc.interactionManager.clickSlot(handler.syncId, i, 0, SlotActionType.QUICK_MOVE, p);
+                        supplyDeficit.merge(s.getItem(), -cnt, Integer::sum);
+                        if (chestSeen != null) chestSeen.merge(s.getItem(), -cnt, Integer::sum);
+                        tookAny = true;
+                        takeClicks++;
+                        return;
+                    }
+                }
+                p.closeHandledScreen();
+                supplyState = 0;
+                planFail = 0; planCd = 0;
+                StringBuilder lack = new StringBuilder();
+                for (Item it : supplyWanted)
+                    if (supplyDeficit.getOrDefault(it, 0) > 0) lack.append(it.getName().getString()).append(", ");
+                if (!tookAny) {
+                    running = false;
+                    msg(p, "В сундуке нет нужных блоков или нет места в инвентаре. Нужно: " + lack);
+                } else {
+                    msg(p, "Взял блоки из сундука, иду строить." + (lack.length() > 0 ? " Ещё не хватает: " + lack : ""));
+                }
+            }
+            default -> supplyState = 0;
+        }
+    }
+
+    // ====================== AUTO-WALK ======================
+
+    private void stopKeys(MinecraftClient mc) {
+        if (holding) {
+            mc.options.forwardKey.setPressed(false);
+            mc.options.jumpKey.setPressed(false);
+            holding = false;
+        }
+    }
+
+    private void stopWalking(MinecraftClient mc) {
+        stopKeys(mc);
+        path = null; pi = 0; stuckTicks = 0; lastHd = 9;
+    }
+
+    private void walk(MinecraftClient mc, ClientPlayerEntity p, ClientWorld w) {
+        if (path == null) {
+            if (!p.isOnGround()) return;
+            if (planCd-- > 0) { stopKeys(mc); return; }
+            plan(p, w);
+            if (path == null) { stopKeys(mc); return; }
+        }
+        followPath(mc, p, w);
+    }
+
+    private void followPath(MinecraftClient mc, ClientPlayerEntity p, ClientWorld w) {
+        if (path == null || pi >= path.size()) { stopWalking(mc); return; }
+        BlockPos next = path.get(pi);
+
+        // the world may have changed (block placed, lava appeared...): re-check the next cell every tick
+        if (!standable(w, next)) { stopWalking(mc); planCd = 0; return; }
+
+        Vec3d pos = p.getPos();
+        double dx = next.getX() + 0.5 - pos.x, dz = next.getZ() + 0.5 - pos.z;
+        double hd = Math.hypot(dx, dz);
+        if (hd < 0.3 && p.getBlockPos().equals(next)) {
+            pi++; stuckTicks = 0; lastHd = 9;
+            if (pi >= path.size()) stopWalking(mc);
+            return;
+        }
+
+        float targetYaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+        float diff = MathHelper.wrapDegrees(targetYaw - p.getYaw());
+        p.setYaw(p.getYaw() + MathHelper.clamp(diff, -45f, 45f));
+        mc.options.forwardKey.setPressed(Math.abs(diff) < 25f && hd > 0.15);
+        mc.options.jumpKey.setPressed(next.getY() > p.getBlockPos().getY() && p.isOnGround() && hd < 1.4);
+        holding = true;
+
+        if (hd < lastHd - 0.02) { lastHd = hd; stuckTicks = 0; } else stuckTicks++;
+        if (stuckTicks > 30) {
+            stopWalking(mc); planCd = 0;
+            if (++stuckTotal > 8) { running = false; msg(p, "Застрял и остановился. Подвинь меня и снова /sc start."); }
+        }
+    }
+
+    private boolean hasItem(ClientPlayerEntity p, Item item) {
+        return invCount.containsKey(item);
+    }
+
+    private boolean validTarget(ClientWorld w, ClientPlayerEntity p, BlockPos pos, BlockState t) {
+        BlockState cur = w.getBlockState(pos);
+        if (!cur.isReplaceable()) return false;
+        if (attempts.getOrDefault(pos, 0) >= 3) return false;
+        Item item = t.getBlock().asItem();
+        if (item == Items.AIR) return false;
+        if (!hasItem(p, item)) { missing.add(item); return false; }
+        if (!airplace) {
+            for (Direction d : Direction.values()) {
+                BlockState ns = w.getBlockState(pos.offset(d));
+                if (!ns.isAir() && !ns.isReplaceable() && !interactive(ns)) return true;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    /** Pick the lowest unfinished layer and compute a safe path to a cell from which something can be placed. */
+    private void plan(ClientPlayerEntity p, ClientWorld w) {
+        blocked.clear();
+        missing.clear();
+        planNeed.clear();
+        invCount.clear();
+        PlayerInventory pinv = p.getInventory();
+        for (int i = 0; i < 36; i++) {
+            ItemStack st = pinv.getStack(i);
+            if (!st.isEmpty()) invCount.merge(st.getItem(), st.getCount(), Integer::sum);
+        }
+        TreeMap<Integer, List<BlockPos>> layers = new TreeMap<>();
+        for (Schematic.Entry e : schem.blocks) {
+            BlockPos pos = origin.add(e.x, e.y, e.z);
+            BlockState cur = w.getBlockState(pos);
+            if (cur.isOf(e.state.getBlock())) continue;
+            blocked.add(pos.asLong());
+            if (skip(e.state)) continue;
+            Item needItem = e.state.getBlock().asItem();
+            if (needItem != Items.AIR && cur.isReplaceable()) planNeed.merge(needItem, 1, Integer::sum);
+            if (validTarget(w, p, pos, e.state)) layers.computeIfAbsent(pos.getY(), k -> new ArrayList<>()).add(pos);
+        }
+        if (layers.isEmpty()) {
+            if (remaining(w) == 0) { running = false; msg(p, "Готово: все блоки поставлены."); return; }
+            if (chestPos != null && !missing.isEmpty()) { startSupply(p); return; }
+            planCd = 20;
+            if (++planFail >= 6) {
+                running = false;
+                StringBuilder sb = new StringBuilder("Остановился: нет доступных блоков для установки.");
+                if (!missing.isEmpty()) {
+                    sb.append(" Не хватает: ");
+                    for (Item i : missing) sb.append(i.getName().getString()).append(", ");
+                }
+                msg(p, sb.toString());
+            }
+            return;
+        }
+
+        BlockPos start = p.getBlockPos();
+        Vec3d pp = p.getPos();
+        int tried = 0;
+        for (List<BlockPos> cand : layers.values()) {
+            if (tried++ >= 3) break;
+            cand.sort(Comparator.comparingDouble(t -> Vec3d.ofCenter(t).squaredDistanceTo(pp)));
+            List<BlockPos> sub = cand.size() > 40 ? new ArrayList<>(cand.subList(0, 40)) : cand;
+            List<BlockPos> found = bfs(w, start, sub);
+            if (found == null) continue;
+            if (found.isEmpty()) {
+                // already in range but placement did not happen: first try to centre on the cell, then give up on those blocks
+                planCd = 5;
+                goalStuck++;
+                if (goalStuck < 4) { path = new ArrayList<>(List.of(start)); pi = 0; stuckTicks = 0; lastHd = 9; }
+                else if (goalStuck >= 8) {
+                    goalStuck = 0;
+                    Vec3d eye = p.getEyePos();
+                    for (BlockPos t : sub) if (eye.squaredDistanceTo(Vec3d.ofCenter(t)) <= REACH * REACH) attempts.merge(t, 3, Integer::sum);
+                }
+                return;
+            }
+            path = found; pi = 0; stuckTicks = 0; lastHd = 9; planFail = 0;
+            return;
+        }
+        planCd = 20;
+        if (++planFail >= 6) {
+            running = false;
+            msg(p, "Остановился: не нахожу безопасный путь к оставшимся блокам.");
+        }
+    }
+
+    private List<BlockPos> bfs(ClientWorld w, BlockPos start, List<BlockPos> cand) {
+        ArrayDeque<BlockPos> q = new ArrayDeque<>();
+        Map<Long, BlockPos> prev = new HashMap<>();
+        q.add(start);
+        prev.put(start.asLong(), null);
+        int expanded = 0;
+        while (!q.isEmpty() && expanded++ < 16000) {
+            BlockPos cur = q.poll();
+            if (isGoal(cur, cand)) {
+                LinkedList<BlockPos> res = new LinkedList<>();
+                for (BlockPos n = cur; n != null && !n.equals(start); n = prev.get(n.asLong())) res.addFirst(n);
+                return res;
+            }
+            for (Direction d : HORIZ) {
+                for (int dy = 1; dy >= -1; dy--) {
+                    BlockPos n = cur.add(d.getOffsetX(), dy, d.getOffsetZ());
+                    if (Math.abs(n.getX() - start.getX()) > 64 || Math.abs(n.getZ() - start.getZ()) > 64
+                            || Math.abs(n.getY() - start.getY()) > 24) continue;
+                    if (prev.containsKey(n.asLong())) continue;
+                    if (!canMove(w, cur, d, dy)) continue;
+                    prev.put(n.asLong(), cur);
+                    q.add(n);
+                }
+            }
+        }
+        return null;
+    }
+
+    private boolean isGoal(BlockPos n, List<BlockPos> cand) {
+        Vec3d eye = new Vec3d(n.getX() + 0.5, n.getY() + 1.62, n.getZ() + 0.5);
+        for (BlockPos t : cand) if (eye.squaredDistanceTo(Vec3d.ofCenter(t)) <= 3.5 * 3.5) return true;
+        return false;
+    }
+
+    /** One cardinal step, optionally up 1 (jump) or down 1. Never drops more than 1 block. */
+    private boolean canMove(ClientWorld w, BlockPos a, Direction d, int dy) {
+        BlockPos b = a.add(d.getOffsetX(), dy, d.getOffsetZ());
+        if (!standable(w, b)) return false;
+        if (blocked.contains(b.asLong()) || blocked.contains(b.up().asLong())) return false;
+        if (dy == 1 && !passable(w, a.up(2))) return false;
+        if (dy == -1 && (!passable(w, a.offset(d)) || !passable(w, a.offset(d).up()))) return false;
+        return true;
+    }
+
+    private static boolean standable(ClientWorld w, BlockPos feet) {
+        return passable(w, feet) && passable(w, feet.up()) && solidFloor(w, feet.down());
+    }
+
+    private static boolean passable(ClientWorld w, BlockPos pos) {
+        BlockState s = w.getBlockState(pos);
+        if (!s.getFluidState().isEmpty() || hazard(s)) return false;
+        return s.getCollisionShape(w, pos).isEmpty();
+    }
+
+    private static boolean solidFloor(ClientWorld w, BlockPos pos) {
+        BlockState s = w.getBlockState(pos);
+        return s.getFluidState().isEmpty() && !hazard(s) && s.isSideSolidFullSquare(w, pos, Direction.UP);
+    }
+
+    private static boolean hazard(BlockState s) {
+        return s.getBlock() instanceof AbstractFireBlock || s.isOf(Blocks.CACTUS) || s.isOf(Blocks.SWEET_BERRY_BUSH)
+                || s.isOf(Blocks.WITHER_ROSE) || s.isOf(Blocks.COBWEB) || s.isOf(Blocks.POWDER_SNOW)
+                || s.isOf(Blocks.CAMPFIRE) || s.isOf(Blocks.SOUL_CAMPFIRE) || s.isOf(Blocks.MAGMA_BLOCK)
+                || s.isOf(Blocks.POINTED_DRIPSTONE);
+    }
+
+    /** Manual airplace: hold use key while the crosshair points at nothing. */
+    private void manual(MinecraftClient mc, ClientPlayerEntity p, ClientWorld w) {
+        if (!manualAirplace || mc.currentScreen != null) return;
+        if (manualCd > 0) { manualCd--; return; }
+        if (!mc.options.useKey.isPressed()) return;
+        if (mc.crosshairTarget != null && mc.crosshairTarget.getType() != HitResult.Type.MISS) return;
+        if (!(p.getMainHandStack().getItem() instanceof BlockItem)) return;
+        Vec3d pt = p.getEyePos().add(p.getRotationVec(1.0f).multiply(airDist));
+        BlockPos pos = BlockPos.ofFloored(pt);
+        if (!w.getBlockState(pos).isReplaceable()) return;
+        BlockHitResult hit = new BlockHitResult(Vec3d.ofCenter(pos), Direction.UP, pos, false);
+        mc.interactionManager.interactBlock(p, Hand.MAIN_HAND, hit);
+        p.swingHand(Hand.MAIN_HAND);
+        manualCd = 3;
+    }
+
+    /** Click the (empty) target position itself: vanilla then places the block exactly there. */
+    private BlockHitResult airHit(BlockPos pos, BlockState t, Vec3d eye) {
+        Direction face = Direction.UP;
+        boolean top = (t.contains(Properties.BLOCK_HALF) && t.get(Properties.BLOCK_HALF) == BlockHalf.TOP)
+                || (t.contains(Properties.SLAB_TYPE) && t.get(Properties.SLAB_TYPE) == SlabType.TOP);
+        if (t.contains(Properties.AXIS)) {
+            face = switch (t.get(Properties.AXIS)) { case X -> Direction.EAST; case Z -> Direction.SOUTH; default -> Direction.UP; };
+        } else if (top) {
+            face = Direction.DOWN;
+        }
+        Vec3d hit = Vec3d.ofCenter(pos).add(face.getOffsetX() * 0.5, face.getOffsetY() * 0.5, face.getOffsetZ() * 0.5);
+        if (hit.squaredDistanceTo(eye) > REACH * REACH) return null;
+        return new BlockHitResult(hit, face, pos, false);
+    }
+
+    public int remaining(ClientWorld w) {
+        int n = 0;
+        for (Schematic.Entry e : schem.blocks) {
+            if (skip(e.state) || e.state.getBlock().asItem() == Items.AIR) continue;
+            if (!w.getBlockState(origin.add(e.x, e.y, e.z)).isOf(e.state.getBlock())) n++;
+        }
+        return n;
+    }
+
+    static boolean skip(BlockState t) {
+        if (t.getBlock() instanceof FluidBlock) return true;
+        if (t.contains(Properties.DOUBLE_BLOCK_HALF) && t.get(Properties.DOUBLE_BLOCK_HALF) == DoubleBlockHalf.UPPER) return true;
+        if (t.contains(Properties.BED_PART) && t.get(Properties.BED_PART) == BedPart.HEAD) return true;
+        if (t.contains(Properties.SLAB_TYPE) && t.get(Properties.SLAB_TYPE) == SlabType.DOUBLE) return true;
+        return false;
+    }
+
+    static boolean interactive(BlockState s) {
+        Block b = s.getBlock();
+        return s.hasBlockEntity() || b instanceof DoorBlock || b instanceof TrapdoorBlock || b instanceof FenceGateBlock
+                || b instanceof ButtonBlock || b instanceof LeverBlock || b instanceof BedBlock
+                || b instanceof CraftingTableBlock || b instanceof AnvilBlock;
+    }
+
+    private BlockHitResult findHit(ClientWorld w, BlockPos pos, BlockState t, Vec3d eye) {
+        if (airplace) return airHit(pos, t, eye);
+        boolean hasHalf = t.contains(Properties.BLOCK_HALF) || t.contains(Properties.SLAB_TYPE);
+        boolean top = (t.contains(Properties.BLOCK_HALF) && t.get(Properties.BLOCK_HALF) == BlockHalf.TOP)
+                || (t.contains(Properties.SLAB_TYPE) && t.get(Properties.SLAB_TYPE) == SlabType.TOP);
+        for (Direction d : Direction.values()) {
+            BlockPos n = pos.offset(d);
+            BlockState ns = w.getBlockState(n);
+            if (ns.isAir() || ns.isReplaceable() || interactive(ns)) continue;
+            Direction face = d.getOpposite();
+            if (t.contains(Properties.AXIS) && face.getAxis() != t.get(Properties.AXIS)) continue;
+            if (hasHalf) {
+                if (face == Direction.UP && top) continue;
+                if (face == Direction.DOWN && !top) continue;
+            }
+            Vec3d hit = Vec3d.ofCenter(n).add(face.getOffsetX() * 0.5, face.getOffsetY() * 0.5, face.getOffsetZ() * 0.5);
+            if (hasHalf && face.getAxis().isHorizontal())
+                hit = new Vec3d(hit.x, n.getY() + (top ? 0.75 : 0.25), hit.z);
+            if (hit.squaredDistanceTo(eye) > REACH * REACH) continue;
+            return new BlockHitResult(hit, face, n, false);
+        }
+        return null;
+    }
+
+    private boolean prepareItem(MinecraftClient mc, ClientPlayerEntity p, Item item) {
+        PlayerInventory inv = p.getInventory();
+        for (int i = 0; i < 9; i++) {
+            ItemStack s = inv.getStack(i);
+            if (!s.isEmpty() && s.isOf(item)) {
+                if (inv.getSelectedSlot() != i) inv.setSelectedSlot(i);
+                return true;
+            }
+        }
+        for (int i = 9; i < 36; i++) {
+            ItemStack s = inv.getStack(i);
+            if (!s.isEmpty() && s.isOf(item)) {
+                mc.interactionManager.clickSlot(p.playerScreenHandler.syncId, i, inv.getSelectedSlot(), SlotActionType.SWAP, p);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static float yawOf(Direction d) {
+        return switch (d) { case SOUTH -> 0f; case WEST -> 90f; case NORTH -> 180f; default -> 270f; };
+    }
+
+    /** Best-effort: pick the look direction that makes vanilla placement produce the target facing. */
+    private float[] desiredRotation(BlockState t, ClientPlayerEntity p) {
+        float yaw = p.getYaw(), pitch = p.getPitch();
+        Block b = t.getBlock();
+        if (t.contains(Properties.HORIZONTAL_FACING)) {
+            Direction f = t.get(Properties.HORIZONTAL_FACING);
+            boolean sameAsLook = b instanceof StairsBlock || b instanceof DoorBlock || b instanceof FenceGateBlock;
+            yaw = yawOf(sameAsLook ? f : f.getOpposite());
+        } else if (t.contains(Properties.FACING)) {
+            Direction look = t.get(Properties.FACING).getOpposite();
+            if (look.getAxis().isHorizontal()) { yaw = yawOf(look); pitch = 0f; }
+            else pitch = look == Direction.UP ? -90f : 90f;
+        }
+        return new float[]{yaw, pitch};
+    }
+
+    private void drawOutline(ClientWorld w, ClientPlayerEntity p) {
+        if (p.getBlockPos().getSquaredDistance(origin) > 64 * 64) return;
+        double x0 = origin.getX(), y0 = origin.getY(), z0 = origin.getZ();
+        double x1 = x0 + schem.sx, y1 = y0 + schem.sy, z1 = z0 + schem.sz;
+        double[][] c = {{x0,y0,z0},{x1,y0,z0},{x1,y0,z1},{x0,y0,z1},{x0,y1,z0},{x1,y1,z0},{x1,y1,z1},{x0,y1,z1}};
+        int[][] edges = {{0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},{0,4},{1,5},{2,6},{3,7}};
+        for (int[] e : edges) {
+            double[] a = c[e[0]], b = c[e[1]];
+            double len = Math.abs(b[0]-a[0]) + Math.abs(b[1]-a[1]) + Math.abs(b[2]-a[2]);
+            int steps = (int) Math.max(2, Math.min(len, 24));
+            for (int i = 0; i <= steps; i++) {
+                double t = i / (double) steps;
+                w.addParticleClient(ParticleTypes.HAPPY_VILLAGER,
+                        a[0] + (b[0]-a[0]) * t, a[1] + (b[1]-a[1]) * t, a[2] + (b[2]-a[2]) * t, 0, 0, 0);
+            }
+        }
+    }
+
+    static void msg(ClientPlayerEntity p, String s) { p.sendMessage(Text.literal("[SC] " + s), false); }
+}
